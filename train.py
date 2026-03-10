@@ -7,26 +7,62 @@ import numpy as np
 np.bool8 = np.bool_
 
 import gym
+import copy
+import matplotlib.pyplot as plt
 import torch
 from torch.optim import Adam
 from policy import PolicyNetwork
 from esn import EchoStateNetwork
 from utils import set_seed, reset_env
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+def moving_average(values, window: int = 20):
+    """
+    Compute moving average for visualization.
+    """
+    if window <= 1:
+        return values
+    out = []
+    for idx in range(len(values)):
+        start = max(0, idx - window + 1)
+        out.append(sum(values[start:idx + 1]) / (idx - start + 1))
+    return out
 
-def train(env_name: str = 'CartPole-v1',
+
+def monte_carlo_action_probs(policy: PolicyNetwork, state: torch.Tensor, num_samples: int) -> torch.Tensor:
+    """
+    Monte Carlo dropout average over policy forward passes.
+    """
+    samples = [policy(state) for _ in range(num_samples)]
+    return torch.stack(samples).mean(0)
+
+
+def update_policy_bank(bank, policy: PolicyNetwork, device: torch.device):
+    """
+    Store a frozen copy of the current policy into the reusable policy bank.
+    """
+    policy_copy = copy.deepcopy(policy).to(device)
+    policy_copy.train()  # keep dropout active for MC averaging
+    for param in policy_copy.parameters():
+        param.requires_grad = False
+    bank.append(policy_copy)
+
+
+def train(policy_reuse: bool = False,
+          env_name: str = 'CartPole-v1',
           seed: int = 1234,
           reservoir_size: int = 500,
           lr: float = 1e-2,
           gamma: float = 0.99,
           num_samples: int = 50,
-          episodes: int = 500,
-          rewards_plot_path: str = 'training_rewards.png') -> None:
+          episodes: int = 500):
     """
-    Train the policy network using REINFORCE with Bayesian model averaging.
+    Train the policy network using REINFORCE.
+
+    If policy_reuse=True, train a mixture policy over all stored previous
+    policies plus the current policy, with learnable reuse probabilities.
+
+    Returns:
+        reward_sums: list[float], per-episode total rewards.
     """
     set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -45,13 +81,35 @@ def train(env_name: str = 'CartPole-v1',
     # Build models
     esn = EchoStateNetwork(input_dim, reservoir_size).to(device)
     policy = PolicyNetwork(esn, action_dim).to(device)
-    optimizer = Adam(policy.parameters(), lr=lr)
+    policy_optimizer = Adam(policy.parameters(), lr=lr)
+
+    # Policy reuse containers
+    policy_bank = []
+    reuse_logits = None
+    reuse_optimizer = None
     reward_sums = []
 
     for episode in range(1, episodes + 1):
         # Reset env at start of each episode (first episode already reset above)
         if episode > 1:
             obs = reset_env(env)
+        
+        # Reset recurrent state for all active policies
+        policy.esn.reset_state()
+        for old_policy in policy_bank:
+            old_policy.esn.reset_state()
+
+        # Update policy bank with the policy from previous training stage
+        if policy_reuse and episode > 1:
+            update_policy_bank(policy_bank, policy, device)
+
+            # Learnable global reuse probabilities over all old policies + current
+            num_candidates = len(policy_bank) + 1
+            old_logits = reuse_logits.detach().cpu() if reuse_logits is not None else None
+            reuse_logits = torch.nn.Parameter(torch.zeros(num_candidates, device=device))
+            if old_logits is not None:
+                reuse_logits.data[:len(old_logits)] = old_logits.to(device)
+            reuse_optimizer = Adam([reuse_logits], lr=lr)
 
         state = torch.tensor(obs, dtype=torch.float32).to(device)
         rewards = []
@@ -59,9 +117,19 @@ def train(env_name: str = 'CartPole-v1',
         done = False
 
         while not done:
-            # Bayesian averaging across num_samples forward passes
-            samples = [policy(state) for _ in range(num_samples)]
-            action_probs = torch.stack(samples).mean(0)
+            if policy_reuse and len(policy_bank) > 0:
+                candidate_policies = policy_bank + [policy]
+                candidate_probs = [
+                    monte_carlo_action_probs(candidate_policy, state, num_samples)
+                    for candidate_policy in candidate_policies
+                ]
+                candidate_probs = torch.stack(candidate_probs)
+
+                mix_weights = torch.softmax(reuse_logits, dim=0)
+                action_probs = torch.sum(mix_weights.unsqueeze(1) * candidate_probs, dim=0)
+            else:
+                action_probs = monte_carlo_action_probs(policy, state, num_samples)
+
             dist = torch.distributions.Categorical(action_probs)
             action = dist.sample()
             log_probs.append(dist.log_prob(action))
@@ -77,9 +145,6 @@ def train(env_name: str = 'CartPole-v1',
             state = torch.tensor(obs, dtype=torch.float32).to(device)
             rewards.append(reward)
 
-        episode_reward = float(sum(rewards))
-        reward_sums.append(episode_reward)
-
         # Compute discounted returns
         returns = []
         R = 0.0
@@ -91,27 +156,50 @@ def train(env_name: str = 'CartPole-v1',
         returns = (returns - returns.mean()) / (returns.std(unbiased=False) + 1e-8)
 
         # Policy gradient update
-        loss = -torch.stack([lp * R for lp, R in zip(log_probs, returns)]).sum()
-        optimizer.zero_grad()
+        loss = -torch.stack([lp * ret for lp, ret in zip(log_probs, returns)]).sum()
+
+        policy_optimizer.zero_grad()
+        if reuse_optimizer is not None:
+            reuse_optimizer.zero_grad()
+
         loss.backward()
-        optimizer.step()
+        policy_optimizer.step()
+        if reuse_optimizer is not None:
+            reuse_optimizer.step()
+
+        reward_sum = sum(rewards)
+        reward_sums.append(reward_sum)
 
         if episode % 10 == 0:
-            print(f'Episode {episode}, Total Reward: {episode_reward}')
+            print(f'Episode {episode}, Total Reward: {reward_sum}')
+        
+        env.close()
+    return reward_sums
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, episodes + 1), reward_sums, label='Episode reward sum')
-    plt.xlabel('Episode')
-    plt.ylabel('Sum of rewards')
-    plt.title('Training Reward per Episode')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(rewards_plot_path)
-    plt.close()
-    print(f'Saved reward plot to {rewards_plot_path}')
-
-    env.close()
 
 if __name__ == '__main__':
-    train()
+    
+    policy_reuse = True
+    reward_sums_reuse = train(policy_reuse=policy_reuse)
+
+    policy_reuse = False
+    reward_sums_no_reuse = train(policy_reuse=policy_reuse)
+
+    window = 20
+    smoothed_no_reuse = moving_average(reward_sums_no_reuse, window=window)
+    smoothed_reuse = moving_average(reward_sums_reuse, window=window)
+
+    plt.figure(figsize=(10, 6))
+    # plt.plot(reward_sums_no_reuse, alpha=0.25, label='No Reuse (raw)', color='tab:blue')
+    plt.plot(smoothed_no_reuse, label=f'No Reuse (MA-{window})', color='tab:blue')
+    # plt.plot(reward_sums_reuse, alpha=0.25, label='Reuse (raw)', color='tab:orange')
+    plt.plot(smoothed_reuse, label=f'Reuse (MA-{window})', color='tab:orange')
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.title('CartPole Reward Curves: Policy Reuse vs No Reuse')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('reward_comparison.png')
+    plt.close()
+    print(f'Saved reward plot to reward_comparison.png')

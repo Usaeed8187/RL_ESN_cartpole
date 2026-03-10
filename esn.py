@@ -58,6 +58,12 @@ class EchoStateNetwork(nn.Module):
         # Readout layer
         self.readout = BayesianReadout(reservoir_size, 2, dropout_rate=0.2)
 
+    def reset_state(self) -> None:
+        """
+        Reset the internal reservoir state between episodes.
+        """
+        self.state.zero_()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # flatten input
         x = x.view(-1)
