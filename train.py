@@ -13,13 +13,18 @@ from policy import PolicyNetwork
 from esn import EchoStateNetwork
 from utils import set_seed, reset_env
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 def train(env_name: str = 'CartPole-v1',
           seed: int = 1234,
           reservoir_size: int = 500,
           lr: float = 1e-2,
           gamma: float = 0.99,
           num_samples: int = 50,
-          episodes: int = 500) -> None:
+          episodes: int = 500,
+          rewards_plot_path: str = 'training_rewards.png') -> None:
     """
     Train the policy network using REINFORCE with Bayesian model averaging.
     """
@@ -41,6 +46,7 @@ def train(env_name: str = 'CartPole-v1',
     esn = EchoStateNetwork(input_dim, reservoir_size).to(device)
     policy = PolicyNetwork(esn, action_dim).to(device)
     optimizer = Adam(policy.parameters(), lr=lr)
+    reward_sums = []
 
     for episode in range(1, episodes + 1):
         # Reset env at start of each episode (first episode already reset above)
@@ -71,6 +77,9 @@ def train(env_name: str = 'CartPole-v1',
             state = torch.tensor(obs, dtype=torch.float32).to(device)
             rewards.append(reward)
 
+        episode_reward = float(sum(rewards))
+        reward_sums.append(episode_reward)
+
         # Compute discounted returns
         returns = []
         R = 0.0
@@ -88,7 +97,19 @@ def train(env_name: str = 'CartPole-v1',
         optimizer.step()
 
         if episode % 10 == 0:
-            print(f'Episode {episode}, Total Reward: {sum(rewards)}')
+            print(f'Episode {episode}, Total Reward: {episode_reward}')
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, episodes + 1), reward_sums, label='Episode reward sum')
+    plt.xlabel('Episode')
+    plt.ylabel('Sum of rewards')
+    plt.title('Training Reward per Episode')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(rewards_plot_path)
+    plt.close()
+    print(f'Saved reward plot to {rewards_plot_path}')
 
     env.close()
 
