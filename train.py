@@ -376,16 +376,21 @@ def train(policy_reuse: bool = False,
 
             with torch.no_grad():
                 new_logits = torch.zeros_like(reuse_logits.data)
+                old_current_idx = pre_len
+                current_logit = reuse_logits.data[old_current_idx]
 
                 # 1) Preserve logits of old policies that remain in the bank
                 for new_idx, old_idx in enumerate(prev_indices):
                     if old_idx is not None:
                         new_logits[new_idx] = reuse_logits.data[old_idx]
+                    else:
+                        # Zero-init would over-prioritize a new old-policy slot if
+                        # the carried-over logits are mostly negative.
+                        new_logits[new_idx] = current_logit
 
                 # 2) Move the current-policy logit to its new slot
-                old_current_idx = pre_len
                 new_current_idx = len(policy_bank)
-                new_logits[new_current_idx] = reuse_logits.data[old_current_idx]
+                new_logits[new_current_idx] = current_logit
 
                 # 3) Preserve DK logit by moving it to the new DK slot
                 if use_domain_knowledge:
@@ -467,9 +472,10 @@ if __name__ == '__main__':
         use_domain_knowledge=True,
         max_policy_bank_size=max_policy_bank_size,
     )
-    reward_sums_reuse_dk = reward_sums_dk_only
+    # reward_sums_reuse_dk = data['reuse_dk']
+    # subpolicy_prob_history = data['subpolicy_prob_history']
 
-    window = 1
+    window = 20
     smoothed_no_reuse = moving_average(reward_sums_no_reuse, window=window)
     smoothed_reuse = moving_average(reward_sums_reuse, window=window)
     smoothed_reuse_dk = moving_average(reward_sums_reuse_dk, window=window)
@@ -490,9 +496,9 @@ if __name__ == '__main__':
 
     plt.figure(figsize=(10, 6))
     # plt.plot(reward_sums_no_reuse, alpha=0.25, label='No Reuse (raw)', color='tab:blue')
-    plt.plot(smoothed_no_reuse, label=f'No Reuse (No domain knowledge)', color='tab:blue')
+    plt.plot(smoothed_no_reuse, label=f'No Reuse', color='tab:blue')
     # plt.plot(reward_sums_reuse, alpha=0.25, label='Reuse (raw)', color='tab:orange')
-    plt.plot(smoothed_reuse, label=f'Reuse', color='tab:orange')
+    plt.plot(smoothed_reuse, label=f'Reuse (No domain knowledge)', color='tab:orange')
     plt.plot(smoothed_reuse_dk, label='Reuse + DK policy', color='tab:green')
     plt.plot(smoothed_dk_only, label='DK policy only', color='tab:red')
     plt.xlabel('Episode')
