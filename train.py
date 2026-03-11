@@ -213,7 +213,7 @@ def train(policy_reuse: bool = False,
           max_policy_bank_size: int = 10,
           score_window: int = 20,
           diversity_threshold: float = 1e-3,
-          dk_initial_prob: float = 0.5):
+          dk_initial_prob: float = 0.9):
     """
     Train the policy network using REINFORCE.
 
@@ -428,10 +428,10 @@ def train(policy_reuse: bool = False,
                 print(f"Episode {episode}, Total Reward: {reward_sum}")
                 if use_domain_knowledge:
                     print(f"DK prob: {dk_prob:.3f}")
-                print(f"RL reuse probs: [{reuse_string}]")
+                print(f"RL reuse probs: [{reuse_string}] \n")
 
             else:
-                print(f"Episode {episode}, Total Reward: {reward_sum}")
+                print(f"Episode {episode}, Total Reward: {reward_sum} \n")
 
     env.close()
     if policy_reuse:
