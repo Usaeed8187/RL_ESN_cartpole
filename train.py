@@ -122,7 +122,7 @@ def evaluate_domain_knowledge_policy(env_name: str = 'CartPole-v1',
         reward_sum = sum(rewards)
         reward_sums.append(reward_sum)
 
-        if episode % 10 == 0:
+        if episode < 10 or episode % 10 == 0:
             print(f'[DK only] Episode {episode}, Total Reward: {reward_sum}, Reuse probs: [1.0]')
 
     env.close()
@@ -146,8 +146,8 @@ def update_policy_bank(bank,
                        device: torch.device,
                        max_bank_size: int,
                        score: float,
-                       diversity_threshold: float = 1e-3,
-                       track_subpolicy_probs: bool = False):
+                       diversity_threshold: float = 1e-3
+                       ):
     """
     Store a frozen copy of the current policy into the reusable policy bank.
 
@@ -212,7 +212,8 @@ def train(policy_reuse: bool = False,
           episodes: int = 500,
           max_policy_bank_size: int = 10,
           score_window: int = 20,
-          diversity_threshold: float = 1e-3):
+          diversity_threshold: float = 1e-3,
+          dk_initial_prob: float = 0.5):
     """
     Train the policy network using REINFORCE.
 
@@ -255,6 +256,15 @@ def train(policy_reuse: bool = False,
         # Next slot is current policy. Optional final slot is DK policy.
         extra_slots = 1 + int(use_domain_knowledge)
         reuse_logits = torch.nn.Parameter(torch.zeros(max_policy_bank_size + extra_slots, device=device))
+
+        # Non-uniform prior: if DK is enabled, bias initial mixing toward DK.
+        if use_domain_knowledge:
+            dk_initial_prob = float(np.clip(dk_initial_prob, 1e-3, 1.0 - 1e-3))
+            current_initial_prob = 1.0 - dk_initial_prob
+            with torch.no_grad():
+                reuse_logits.data[0] = np.log(current_initial_prob)
+                reuse_logits.data[1] = np.log(dk_initial_prob)
+
         reuse_optimizer = Adam([reuse_logits], lr=lr)
 
     reward_sums = []
@@ -272,11 +282,15 @@ def train(policy_reuse: bool = False,
             old_policy.esn.reset_state()
 
         if policy_reuse:
-            active_count = len(policy_bank) + 1 + int(use_domain_knowledge)
+            bank_size_at_episode_start = len(policy_bank)
+            active_count = bank_size_at_episode_start + 1 + int(use_domain_knowledge)
             active_probs = torch.softmax(reuse_logits[:active_count], dim=0)
             padded_probs = torch.zeros(total_reuse_slots, device=device)
             padded_probs[:active_count] = active_probs
-            subpolicy_prob_history.append(padded_probs.detach().cpu().numpy())
+            subpolicy_prob_history.append({
+                'bank_size': bank_size_at_episode_start,
+                'probs': padded_probs.detach().cpu().numpy()
+            })
 
         state = torch.tensor(obs, dtype=torch.float32).to(device)
         rewards = []
@@ -284,7 +298,7 @@ def train(policy_reuse: bool = False,
         done = False
 
         while not done:
-            if policy_reuse and len(policy_bank) > 0:
+            if policy_reuse and (len(policy_bank) > 0 or use_domain_knowledge):
                 # Runtime safety check: the current live policy should never also
                 # appear inside the old-policy bank used for this rollout.
                 assert all(old_policy is not policy for _, old_policy in policy_bank)
@@ -362,19 +376,24 @@ def train(policy_reuse: bool = False,
 
             with torch.no_grad():
                 new_logits = torch.zeros_like(reuse_logits.data)
+
+                # 1) Preserve logits of old policies that remain in the bank
                 for new_idx, old_idx in enumerate(prev_indices):
                     if old_idx is not None:
                         new_logits[new_idx] = reuse_logits.data[old_idx]
 
-                # Keep the current-policy bias when moving to a new active slot.
-                new_current_idx = len(policy_bank)
+                # 2) Move the current-policy logit to its new slot
                 old_current_idx = pre_len
+                new_current_idx = len(policy_bank)
                 new_logits[new_current_idx] = reuse_logits.data[old_current_idx]
-                reuse_logits.data.copy_(new_logits)
 
-            if len(policy_bank) == 0:
-                with torch.no_grad():
-                    reuse_logits.data[0] = 0.0
+                # 3) Preserve DK logit by moving it to the new DK slot
+                if use_domain_knowledge:
+                    old_dk_idx = pre_len + 1
+                    new_dk_idx = len(policy_bank) + 1
+                    new_logits[new_dk_idx] = reuse_logits.data[old_dk_idx]
+
+                reuse_logits.data.copy_(new_logits)
 
         loss.backward()
         policy_optimizer.step()
@@ -384,22 +403,25 @@ def train(policy_reuse: bool = False,
         reward_sum = sum(rewards)
         reward_sums.append(reward_sum)
 
-        if episode % 10 == 0:
+        if episode < 10 or episode % 10 == 0:
             if policy_reuse and len(subpolicy_prob_history) > 0:
-                active_count = len(policy_bank) + 1 + int(use_domain_knowledge)
-                active_probs = subpolicy_prob_history[-1][:active_count].tolist()
+                hist_entry = subpolicy_prob_history[-1]
+                num_old = hist_entry['bank_size']
+                active_count = num_old + 1 + int(use_domain_knowledge)
+                active_probs = hist_entry['probs'][:active_count].tolist()
 
-                num_old = len(policy_bank)
-
+                old_probs = active_probs[:num_old]
                 new_prob = active_probs[num_old]
                 dk_prob = active_probs[num_old + 1] if use_domain_knowledge else None
 
-                old_probs = active_probs[:num_old]
+                # show old policies in descending probability order
+                old_probs_sorted = sorted(enumerate(old_probs, start=1),
+                                          key=lambda x: x[1],
+                                          reverse=True)
 
-                # format reuse probabilities
                 reuse_parts = [f"new:{new_prob:.3f}"]
-                for i, p in enumerate(old_probs):
-                    reuse_parts.append(f"old{i+1}:{p:.3f}")
+                for rank, (old_idx, p) in enumerate(old_probs_sorted, start=1):
+                    reuse_parts.append(f"old{rank}:{p:.3f}")
 
                 reuse_string = ", ".join(reuse_parts)
 
@@ -407,13 +429,14 @@ def train(policy_reuse: bool = False,
                 if use_domain_knowledge:
                     print(f"DK prob: {dk_prob:.3f}")
                 print(f"RL reuse probs: [{reuse_string}]")
-                
+
             else:
-                print(f'Episode {episode}, Total Reward: {reward_sum}')
+                print(f"Episode {episode}, Total Reward: {reward_sum}")
 
     env.close()
     if policy_reuse:
-        return reward_sums, np.asarray(subpolicy_prob_history)
+        prob_array = np.asarray([entry['probs'] for entry in subpolicy_prob_history])
+        return reward_sums, prob_array
     return reward_sums, None
 
 
@@ -444,8 +467,9 @@ if __name__ == '__main__':
         use_domain_knowledge=True,
         max_policy_bank_size=max_policy_bank_size,
     )
+    reward_sums_reuse_dk = reward_sums_dk_only
 
-    window = 50
+    window = 1
     smoothed_no_reuse = moving_average(reward_sums_no_reuse, window=window)
     smoothed_reuse = moving_average(reward_sums_reuse, window=window)
     smoothed_reuse_dk = moving_average(reward_sums_reuse_dk, window=window)
