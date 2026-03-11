@@ -27,6 +27,33 @@ def moving_average(values, window: int = 20):
         out.append(sum(values[start:idx + 1]) / (idx - start + 1))
     return out
 
+def plot_subpolicy_probabilities(probability_history,
+                                 labels,
+                                 output_path: str):
+    """
+    Plot sub-policy mixture probabilities across episodes.
+    """
+    if len(probability_history) == 0:
+        print('No sub-policy probability history to plot.')
+        return
+
+    probs = np.asarray(probability_history)
+    episodes = np.arange(1, probs.shape[0] + 1)
+
+    plt.figure(figsize=(11, 6))
+    for idx, label in enumerate(labels):
+        plt.plot(episodes, probs[:, idx], label=label)
+
+    plt.xlabel('Episode')
+    plt.ylabel('Mixture Probability')
+    plt.title('Sub-policy Usage Probabilities Across Episodes')
+    plt.ylim(0.0, 1.0)
+    plt.grid(alpha=0.3)
+    plt.legend(loc='upper right', ncol=2)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    print(f'Saved sub-policy probability plot to {output_path}')
 
 def monte_carlo_action_probs(policy: PolicyNetwork, state: torch.Tensor, num_samples: int) -> torch.Tensor:
     """
@@ -44,7 +71,7 @@ def domain_knowledge_action_probs(state: torch.Tensor) -> torch.Tensor:
     """
     # State order for CartPole-v1: [cart_pos, cart_vel, pole_angle, pole_ang_vel]
     cart_pos, cart_vel, pole_angle, pole_ang_vel = state
-    score = 0.5 * cart_pos + 1.0 * cart_vel + 8.0 * pole_angle + 1.5 * pole_ang_vel
+    score = 0.2 * cart_pos + 0.2 * cart_vel + 0.4 * pole_angle + 0.5 * pole_ang_vel
     probs = torch.zeros(2, dtype=state.dtype, device=state.device)
     # Gym CartPole action mapping: 0=left, 1=right
     probs[1 if score > 0 else 0] = 1.0
@@ -119,7 +146,8 @@ def update_policy_bank(bank,
                        device: torch.device,
                        max_bank_size: int,
                        score: float,
-                       diversity_threshold: float = 1e-3):
+                       diversity_threshold: float = 1e-3,
+                       track_subpolicy_probs: bool = False):
     """
     Store a frozen copy of the current policy into the reusable policy bank.
 
@@ -194,6 +222,9 @@ def train(policy_reuse: bool = False,
 
     Returns:
         reward_sums: list[float], per-episode total rewards.
+        subpolicy_prob_history: np.ndarray with shape
+            (episodes, max_policy_bank_size + 1 + int(use_domain_knowledge))
+            if policy_reuse=True, else None.
     """
     set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -227,6 +258,8 @@ def train(policy_reuse: bool = False,
         reuse_optimizer = Adam([reuse_logits], lr=lr)
 
     reward_sums = []
+    subpolicy_prob_history = []
+    total_reuse_slots = max_policy_bank_size + 1 + int(use_domain_knowledge)
 
     for episode in range(1, episodes + 1):
         # Reset env at start of each episode (first episode already reset above)
@@ -237,6 +270,13 @@ def train(policy_reuse: bool = False,
         policy.esn.reset_state()
         for _, old_policy in policy_bank:
             old_policy.esn.reset_state()
+
+        if policy_reuse:
+            active_count = len(policy_bank) + 1 + int(use_domain_knowledge)
+            active_probs = torch.softmax(reuse_logits[:active_count], dim=0)
+            padded_probs = torch.zeros(total_reuse_slots, device=device)
+            padded_probs[:active_count] = active_probs
+            subpolicy_prob_history.append(padded_probs.detach().cpu().numpy())
 
         state = torch.tensor(obs, dtype=torch.float32).to(device)
         rewards = []
@@ -348,51 +388,57 @@ def train(policy_reuse: bool = False,
             print(f'Episode {episode}, Total Reward: {reward_sum}')
 
     env.close()
-    return reward_sums
+    if policy_reuse:
+        return reward_sums, np.asarray(subpolicy_prob_history)
+    return reward_sums, None
 
 
 if __name__ == '__main__':
-    max_policy_bank_size = 10
+    max_policy_bank_size = 9
 
     data = np.load('results/reward_sums.npz')
 
-    # reward_sums_reuse = train(
+    # reward_sums_reuse, _ = train(
     #     policy_reuse=True,
     #     use_domain_knowledge=False,
     #     max_policy_bank_size=max_policy_bank_size,
     # )
     reward_sums_reuse = data['reuse']
 
-    # reward_sums_no_reuse = train(
+    # reward_sums_no_reuse, _ = train(
     #     policy_reuse=False,
     #     use_domain_knowledge=False,
     #     max_policy_bank_size=max_policy_bank_size,
     # )
     reward_sums_no_reuse = data['no_reuse']
 
-    reward_sums_dk_only = evaluate_domain_knowledge_policy()
+    # reward_sums_dk_only = evaluate_domain_knowledge_policy()
+    reward_sums_dk_only = data['dk_only']
 
-    # reward_sums_reuse_dk = train(
-    #     policy_reuse=True,
-    #     use_domain_knowledge=True,
-    #     max_policy_bank_size=max_policy_bank_size,
-    # )
+    reward_sums_reuse_dk, subpolicy_prob_history = train(
+        policy_reuse=True,
+        use_domain_knowledge=True,
+        max_policy_bank_size=max_policy_bank_size,
+    )
 
-    window = 20
+    window = 50
     smoothed_no_reuse = moving_average(reward_sums_no_reuse, window=window)
     smoothed_reuse = moving_average(reward_sums_reuse, window=window)
-    # smoothed_reuse_dk = moving_average(reward_sums_reuse_dk, window=window)
+    smoothed_reuse_dk = moving_average(reward_sums_reuse_dk, window=window)
     smoothed_dk_only = moving_average(reward_sums_dk_only, window=window)
 
     np.savez('results/reward_sums.npz',
              no_reuse=reward_sums_no_reuse,
              reuse=reward_sums_reuse,
-            #  reuse_dk=reward_sums_reuse_dk,
+             reuse_dk=reward_sums_reuse_dk,
              dk_only=reward_sums_dk_only,
              smoothed_no_reuse=smoothed_no_reuse,
              smoothed_reuse=smoothed_reuse,
-            #  smoothed_reuse_dk=smoothed_reuse_dk,
-             smoothed_dk_only=smoothed_dk_only)
+             smoothed_reuse_dk=smoothed_reuse_dk,
+             smoothed_dk_only=smoothed_dk_only,
+             smoothed_reuse_dk=smoothed_reuse_dk,
+             subpolicy_prob_history=subpolicy_prob_history
+             )
     print(f'Saved raw and smoothed reward sums to results/reward_sums.npz')
 
     plt.figure(figsize=(10, 6))
@@ -400,7 +446,7 @@ if __name__ == '__main__':
     plt.plot(smoothed_no_reuse, label=f'No Reuse (No domain knowledge)', color='tab:blue')
     # plt.plot(reward_sums_reuse, alpha=0.25, label='Reuse (raw)', color='tab:orange')
     plt.plot(smoothed_reuse, label=f'Reuse', color='tab:orange')
-    # plt.plot(smoothed_reuse_dk, label='Reuse + DK policy', color='tab:green')
+    plt.plot(smoothed_reuse_dk, label='Reuse + DK policy', color='tab:green')
     plt.plot(smoothed_dk_only, label='DK policy only', color='tab:red')
     plt.xlabel('Episode')
     plt.ylabel('Total Reward')
@@ -411,3 +457,10 @@ if __name__ == '__main__':
     plt.savefig('results/reward_comparison.png')
     plt.close()
     print(f'Saved reward plot to reward_comparison.png')
+
+    subpolicy_labels = [f'Old policy {idx + 1}' for idx in range(max_policy_bank_size)]
+    subpolicy_labels += ['New policy', 'Domain-knowledge policy']
+    plot_subpolicy_probabilities(subpolicy_prob_history,
+                                 subpolicy_labels,
+                                 'results/subpolicy_probabilities.png')
+    
