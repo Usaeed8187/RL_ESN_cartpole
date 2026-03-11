@@ -36,15 +36,21 @@ def monte_carlo_action_probs(policy: PolicyNetwork, state: torch.Tensor, num_sam
     return torch.stack(samples).mean(0)
 
 
-def update_policy_bank(bank, policy: PolicyNetwork, device: torch.device):
+def update_policy_bank(bank, policy: PolicyNetwork, device: torch.device, max_bank_size: int):
     """
     Store a frozen copy of the current policy into the reusable policy bank.
+
+    Bank selection strategy (bounded bank): keep the most recent `max_bank_size`
+    policy snapshots (FIFO). When the bank is full, we drop the oldest snapshot
+    and append the newest one.
     """
     policy_copy = copy.deepcopy(policy).to(device)
     policy_copy.train()  # keep dropout active for MC averaging
     for param in policy_copy.parameters():
         param.requires_grad = False
     bank.append(policy_copy)
+    if len(bank) > max_bank_size:
+        bank.pop(0)
 
 
 def train(policy_reuse: bool = False,
@@ -54,11 +60,12 @@ def train(policy_reuse: bool = False,
           lr: float = 1e-2,
           gamma: float = 0.99,
           num_samples: int = 50,
-          episodes: int = 500):
+          episodes: int = 500,
+          max_policy_bank_size: int = 10):
     """
     Train the policy network using REINFORCE.
 
-    If policy_reuse=True, train a mixture policy over all stored previous
+    If policy_reuse=True, train a mixture policy over a bounded bank of previous
     policies plus the current policy, with learnable reuse probabilities.
 
     Returns:
@@ -87,6 +94,12 @@ def train(policy_reuse: bool = False,
     policy_bank = []
     reuse_logits = None
     reuse_optimizer = None
+    if policy_reuse:
+        # Persistent logits/optimizer: we keep one set for the whole run.
+        # Slots [0:max_policy_bank_size) are for old policies, slot [-1] is current policy.
+        reuse_logits = torch.nn.Parameter(torch.zeros(max_policy_bank_size + 1, device=device))
+        reuse_optimizer = Adam([reuse_logits], lr=lr)
+
     reward_sums = []
 
     for episode in range(1, episodes + 1):
@@ -101,15 +114,15 @@ def train(policy_reuse: bool = False,
 
         # Update policy bank with the policy from previous training stage
         if policy_reuse and episode > 1:
-            update_policy_bank(policy_bank, policy, device)
+            pre_len = len(policy_bank)
+            update_policy_bank(policy_bank, policy, device, max_policy_bank_size)
 
-            # Learnable global reuse probabilities over all old policies + current
-            num_candidates = len(policy_bank) + 1
-            old_logits = reuse_logits.detach().cpu() if reuse_logits is not None else None
-            reuse_logits = torch.nn.Parameter(torch.zeros(num_candidates, device=device))
-            if old_logits is not None:
-                reuse_logits.data[:len(old_logits)] = old_logits.to(device)
-            reuse_optimizer = Adam([reuse_logits], lr=lr)
+            # If FIFO eviction happened, shift corresponding logits left so each
+            # bank slot keeps matching the same policy index in the bounded bank.
+            if pre_len == max_policy_bank_size:
+                with torch.no_grad():
+                    reuse_logits.data[:-2] = reuse_logits.data[1:-1].clone()
+                    reuse_logits.data[-2] = 0.0
 
         state = torch.tensor(obs, dtype=torch.float32).to(device)
         rewards = []
@@ -118,14 +131,23 @@ def train(policy_reuse: bool = False,
 
         while not done:
             if policy_reuse and len(policy_bank) > 0:
-                candidate_policies = policy_bank + [policy]
-                candidate_probs = [
-                    monte_carlo_action_probs(candidate_policy, state, num_samples)
-                    for candidate_policy in candidate_policies
-                ]
+                candidate_probs = []
+
+                # Frozen old policies: inference-only to avoid autograd overhead.
+                with torch.no_grad():
+                    for old_policy in policy_bank:
+                        old_probs = monte_carlo_action_probs(old_policy, state, num_samples)
+                        candidate_probs.append(old_probs)
+
+                # Current policy remains differentiable.
+                current_probs = monte_carlo_action_probs(policy, state, num_samples)
+                candidate_probs.append(current_probs)
                 candidate_probs = torch.stack(candidate_probs)
 
-                mix_weights = torch.softmax(reuse_logits, dim=0)
+                # Use only active logits: one per bank policy plus one for current policy.
+                active_count = len(policy_bank) + 1
+                active_logits = reuse_logits[:active_count]
+                mix_weights = torch.softmax(active_logits, dim=0)
                 action_probs = torch.sum(mix_weights.unsqueeze(1) * candidate_probs, dim=0)
             else:
                 action_probs = monte_carlo_action_probs(policy, state, num_samples)
@@ -172,18 +194,19 @@ def train(policy_reuse: bool = False,
 
         if episode % 10 == 0:
             print(f'Episode {episode}, Total Reward: {reward_sum}')
-        
-        env.close()
+
+    env.close()
     return reward_sums
 
 
 if __name__ == '__main__':
-    
+    max_policy_bank_size = 10
+
     policy_reuse = True
-    reward_sums_reuse = train(policy_reuse=policy_reuse)
+    reward_sums_reuse = train(policy_reuse=policy_reuse, max_policy_bank_size=max_policy_bank_size)
 
     policy_reuse = False
-    reward_sums_no_reuse = train(policy_reuse=policy_reuse)
+    reward_sums_no_reuse = train(policy_reuse=policy_reuse, max_policy_bank_size=max_policy_bank_size)
 
     window = 20
     smoothed_no_reuse = moving_average(reward_sums_no_reuse, window=window)
