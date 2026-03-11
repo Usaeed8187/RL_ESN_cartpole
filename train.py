@@ -50,6 +50,57 @@ def domain_knowledge_action_probs(state: torch.Tensor) -> torch.Tensor:
     probs[1 if score > 0 else 0] = 1.0
     return probs
 
+def evaluate_domain_knowledge_policy(env_name: str = 'CartPole-v1',
+                                     seed: int = 1234,
+                                     episodes: int = 500):
+    """
+    Evaluate the fixed domain-knowledge policy without learned components.
+
+    Returns:
+        reward_sums: list[float], per-episode total rewards.
+    """
+    set_seed(seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    try:
+        env = gym.make(env_name, new_step_api=True)
+    except TypeError:
+        env = gym.make(env_name)
+
+    reward_sums = []
+    obs = reset_env(env, seed)
+
+    for episode in range(1, episodes + 1):
+        if episode > 1:
+            obs = reset_env(env)
+
+        state = torch.tensor(obs, dtype=torch.float32).to(device)
+        done = False
+        rewards = []
+
+        while not done:
+            action_probs = domain_knowledge_action_probs(state)
+            action = torch.argmax(action_probs).item()
+
+            out = env.step(action)
+            if len(out) == 5:
+                obs, reward, terminated, truncated, _ = out
+                done = terminated or truncated
+            else:
+                obs, reward, done, _ = out
+
+            rewards.append(reward)
+            state = torch.tensor(obs, dtype=torch.float32).to(device)
+
+        reward_sum = sum(rewards)
+        reward_sums.append(reward_sum)
+
+        if episode % 10 == 0:
+            print(f'[DK only] Episode {episode}, Total Reward: {reward_sum}')
+
+    env.close()
+    return reward_sums
+
 def _policy_distance(policy_a: PolicyNetwork, policy_b: PolicyNetwork) -> float:
     """
     Mean L2 distance across flattened parameters for two policy snapshots.
@@ -319,24 +370,29 @@ if __name__ == '__main__':
     # )
     reward_sums_no_reuse = data['no_reuse']
 
-    reward_sums_reuse_dk = train(
-        policy_reuse=True,
-        use_domain_knowledge=True,
-        max_policy_bank_size=max_policy_bank_size,
-    )
+    reward_sums_dk_only = evaluate_domain_knowledge_policy()
+
+    # reward_sums_reuse_dk = train(
+    #     policy_reuse=True,
+    #     use_domain_knowledge=True,
+    #     max_policy_bank_size=max_policy_bank_size,
+    # )
 
     window = 20
     smoothed_no_reuse = moving_average(reward_sums_no_reuse, window=window)
     smoothed_reuse = moving_average(reward_sums_reuse, window=window)
-    smoothed_reuse_dk = moving_average(reward_sums_reuse_dk, window=window)
+    # smoothed_reuse_dk = moving_average(reward_sums_reuse_dk, window=window)
+    smoothed_dk_only = moving_average(reward_sums_dk_only, window=window)
 
     np.savez('results/reward_sums.npz',
              no_reuse=reward_sums_no_reuse,
              reuse=reward_sums_reuse,
-             reuse_dk=reward_sums_reuse_dk,
+            #  reuse_dk=reward_sums_reuse_dk,
+             dk_only=reward_sums_dk_only,
              smoothed_no_reuse=smoothed_no_reuse,
              smoothed_reuse=smoothed_reuse,
-             smoothed_reuse_dk=smoothed_reuse_dk)
+            #  smoothed_reuse_dk=smoothed_reuse_dk,
+             smoothed_dk_only=smoothed_dk_only)
     print(f'Saved raw and smoothed reward sums to results/reward_sums.npz')
 
     plt.figure(figsize=(10, 6))
@@ -345,9 +401,10 @@ if __name__ == '__main__':
     # plt.plot(reward_sums_reuse, alpha=0.25, label='Reuse (raw)', color='tab:orange')
     plt.plot(smoothed_reuse, label=f'Reuse', color='tab:orange')
     # plt.plot(smoothed_reuse_dk, label='Reuse + DK policy', color='tab:green')
+    plt.plot(smoothed_dk_only, label='DK policy only', color='tab:red')
     plt.xlabel('Episode')
     plt.ylabel('Total Reward')
-    plt.title('CartPole Reward Curves: No Reuse vs Reuse vs Reuse+DK')
+    plt.title('CartPole Reward Curves: No Reuse vs Reuse vs Reuse+DK vs DK only')
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
