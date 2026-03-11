@@ -35,6 +35,20 @@ def monte_carlo_action_probs(policy: PolicyNetwork, state: torch.Tensor, num_sam
     samples = [policy(state) for _ in range(num_samples)]
     return torch.stack(samples).mean(0)
 
+def domain_knowledge_action_probs(state: torch.Tensor) -> torch.Tensor:
+    """
+    CartPole domain-knowledge controller expressed as a deterministic policy.
+
+    Uses a linear stabilizing score over [x, x_dot, theta, theta_dot] where
+    angle terms dominate. Returns one-hot probabilities over [left, right].
+    """
+    # State order for CartPole-v1: [cart_pos, cart_vel, pole_angle, pole_ang_vel]
+    cart_pos, cart_vel, pole_angle, pole_ang_vel = state
+    score = 0.5 * cart_pos + 1.0 * cart_vel + 8.0 * pole_angle + 1.5 * pole_ang_vel
+    probs = torch.zeros(2, dtype=state.dtype, device=state.device)
+    # Gym CartPole action mapping: 0=left, 1=right
+    probs[1 if score > 0 else 0] = 1.0
+    return probs
 
 def _policy_distance(policy_a: PolicyNetwork, policy_b: PolicyNetwork) -> float:
     """
@@ -109,6 +123,7 @@ def update_policy_bank(bank,
 
 
 def train(policy_reuse: bool = False,
+          use_domain_knowledge: bool = False,
           env_name: str = 'CartPole-v1',
           seed: int = 1234,
           reservoir_size: int = 500,
@@ -123,7 +138,8 @@ def train(policy_reuse: bool = False,
     Train the policy network using REINFORCE.
 
     If policy_reuse=True, train a mixture policy over a bounded bank of previous
-    policies plus the current policy, with learnable reuse probabilities.
+    policies plus the current policy (and optionally a fixed domain-knowledge
+    policy), with learnable reuse probabilities.
 
     Returns:
         reward_sums: list[float], per-episode total rewards.
@@ -153,8 +169,10 @@ def train(policy_reuse: bool = False,
     reuse_optimizer = None
     if policy_reuse:
         # Persistent logits/optimizer: we keep one set for the whole run.
-        # Slots [0:max_policy_bank_size) are for old policies, slot [-1] is current policy.
-        reuse_logits = torch.nn.Parameter(torch.zeros(max_policy_bank_size + 1, device=device))
+        # Slots [0:max_policy_bank_size) are for old policies.
+        # Next slot is current policy. Optional final slot is DK policy.
+        extra_slots = 1 + int(use_domain_knowledge)
+        reuse_logits = torch.nn.Parameter(torch.zeros(max_policy_bank_size + extra_slots, device=device))
         reuse_optimizer = Adam([reuse_logits], lr=lr)
 
     reward_sums = []
@@ -190,10 +208,15 @@ def train(policy_reuse: bool = False,
                 # Current policy remains differentiable.
                 current_probs = monte_carlo_action_probs(policy, state, num_samples)
                 candidate_probs.append(current_probs)
+
+                if use_domain_knowledge:
+                    candidate_probs.append(domain_knowledge_action_probs(state))
+
                 candidate_probs = torch.stack(candidate_probs)
 
-                # Use only active logits: one per bank policy plus one for current policy.
-                active_count = len(policy_bank) + 1
+                # Use only active logits: one per bank policy plus current policy,
+                # and optionally one fixed DK policy.
+                active_count = len(policy_bank) + 1 + int(use_domain_knowledge)
                 active_logits = reuse_logits[:active_count]
                 mix_weights = torch.softmax(active_logits, dim=0)
                 action_probs = torch.sum(mix_weights.unsqueeze(1) * candidate_probs, dim=0)
@@ -280,21 +303,40 @@ def train(policy_reuse: bool = False,
 if __name__ == '__main__':
     max_policy_bank_size = 10
 
-    policy_reuse = True
-    reward_sums_reuse = train(policy_reuse=policy_reuse, max_policy_bank_size=max_policy_bank_size)
+    data = np.load('results/reward_sums.npz')
 
-    policy_reuse = False
-    reward_sums_no_reuse = train(policy_reuse=policy_reuse, max_policy_bank_size=max_policy_bank_size)
+    # reward_sums_reuse = train(
+    #     policy_reuse=True,
+    #     use_domain_knowledge=False,
+    #     max_policy_bank_size=max_policy_bank_size,
+    # )
+    reward_sums_reuse = data['reuse']
+
+    # reward_sums_no_reuse = train(
+    #     policy_reuse=False,
+    #     use_domain_knowledge=False,
+    #     max_policy_bank_size=max_policy_bank_size,
+    # )
+    reward_sums_no_reuse = data['no_reuse']
+
+    reward_sums_reuse_dk = train(
+        policy_reuse=True,
+        use_domain_knowledge=True,
+        max_policy_bank_size=max_policy_bank_size,
+    )
 
     window = 20
     smoothed_no_reuse = moving_average(reward_sums_no_reuse, window=window)
     smoothed_reuse = moving_average(reward_sums_reuse, window=window)
+    smoothed_reuse_dk = moving_average(reward_sums_reuse_dk, window=window)
 
     np.savez('results/reward_sums.npz',
              no_reuse=reward_sums_no_reuse,
              reuse=reward_sums_reuse,
+             reuse_dk=reward_sums_reuse_dk,
              smoothed_no_reuse=smoothed_no_reuse,
-             smoothed_reuse=smoothed_reuse)
+             smoothed_reuse=smoothed_reuse,
+             smoothed_reuse_dk=smoothed_reuse_dk)
     print(f'Saved raw and smoothed reward sums to results/reward_sums.npz')
 
     plt.figure(figsize=(10, 6))
@@ -302,9 +344,10 @@ if __name__ == '__main__':
     plt.plot(smoothed_no_reuse, label=f'No Reuse (No domain knowledge)', color='tab:blue')
     # plt.plot(reward_sums_reuse, alpha=0.25, label='Reuse (raw)', color='tab:orange')
     plt.plot(smoothed_reuse, label=f'Reuse', color='tab:orange')
+    # plt.plot(smoothed_reuse_dk, label='Reuse + DK policy', color='tab:green')
     plt.xlabel('Episode')
     plt.ylabel('Total Reward')
-    plt.title('CartPole Reward Curves: Policy Reuse vs No Reuse')
+    plt.title('CartPole Reward Curves: No Reuse vs Reuse vs Reuse+DK')
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
