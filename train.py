@@ -436,7 +436,6 @@ if __name__ == '__main__':
              smoothed_reuse=smoothed_reuse,
              smoothed_reuse_dk=smoothed_reuse_dk,
              smoothed_dk_only=smoothed_dk_only,
-             smoothed_reuse_dk=smoothed_reuse_dk,
              subpolicy_prob_history=subpolicy_prob_history
              )
     print(f'Saved raw and smoothed reward sums to results/reward_sums.npz')
