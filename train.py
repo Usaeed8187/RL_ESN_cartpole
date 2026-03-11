@@ -36,21 +36,76 @@ def monte_carlo_action_probs(policy: PolicyNetwork, state: torch.Tensor, num_sam
     return torch.stack(samples).mean(0)
 
 
-def update_policy_bank(bank, policy: PolicyNetwork, device: torch.device, max_bank_size: int):
+def _policy_distance(policy_a: PolicyNetwork, policy_b: PolicyNetwork) -> float:
+    """
+    Mean L2 distance across flattened parameters for two policy snapshots.
+    """
+    sq_sum = 0.0
+    param_count = 0
+    for param_a, param_b in zip(policy_a.parameters(), policy_b.parameters()):
+        diff = (param_a.detach() - param_b.detach()).reshape(-1)
+        sq_sum += torch.dot(diff, diff).item()
+        param_count += diff.numel()
+    return (sq_sum / max(param_count, 1)) ** 0.5
+
+
+def update_policy_bank(bank,
+                       policy: PolicyNetwork,
+                       device: torch.device,
+                       max_bank_size: int,
+                       score: float,
+                       diversity_threshold: float = 1e-3):
     """
     Store a frozen copy of the current policy into the reusable policy bank.
 
-    Bank selection strategy (bounded bank): keep the most recent `max_bank_size`
-    policy snapshots (FIFO). When the bank is full, we drop the oldest snapshot
-    and append the newest one.
+    Bank structure: list of (score, policy_snapshot).
+    Selection strategy: keep top-k snapshots by score (descending).
+    Optional diversity rule: avoid near-duplicates by checking parameter distance.
+
+    Returns:
+        prev_indices: For each new bank slot, index of the same policy in the
+            previous bank ordering (or None if newly inserted/replaced).
     """
+    old_policies = [entry[1] for entry in bank]
+
     policy_copy = copy.deepcopy(policy).to(device)
     policy_copy.train()  # keep dropout active for MC averaging
     for param in policy_copy.parameters():
         param.requires_grad = False
-    bank.append(policy_copy)
+    replaced_duplicate = False
+    if diversity_threshold is not None and diversity_threshold > 0 and len(bank) > 0:
+        best_idx = None
+        best_dist = float('inf')
+        for idx, (_, old_policy) in enumerate(bank):
+            dist = _policy_distance(policy_copy, old_policy)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+
+        if best_dist < diversity_threshold and best_idx is not None:
+            old_score, _ = bank[best_idx]
+            if score > old_score:
+                bank[best_idx] = (score, policy_copy)
+            replaced_duplicate = True
+
+    if not replaced_duplicate:
+        bank.append((score, policy_copy))
+
+    bank.sort(key=lambda item: item[0], reverse=True)
+
     if len(bank) > max_bank_size:
-        bank.pop(0)
+        del bank[max_bank_size:]
+
+    prev_indices = []
+    for _, new_policy in bank:
+        old_idx = None
+        for idx, old_policy in enumerate(old_policies):
+            if new_policy is old_policy:
+                old_idx = idx
+                break
+        prev_indices.append(old_idx)
+
+    return prev_indices
 
 
 def train(policy_reuse: bool = False,
@@ -61,7 +116,9 @@ def train(policy_reuse: bool = False,
           gamma: float = 0.99,
           num_samples: int = 50,
           episodes: int = 500,
-          max_policy_bank_size: int = 10):
+          max_policy_bank_size: int = 10,
+          score_window: int = 20,
+          diversity_threshold: float = 1e-3):
     """
     Train the policy network using REINFORCE.
 
@@ -109,7 +166,7 @@ def train(policy_reuse: bool = False,
         
         # Reset recurrent state for all active policies
         policy.esn.reset_state()
-        for old_policy in policy_bank:
+        for _, old_policy in policy_bank:
             old_policy.esn.reset_state()
 
         state = torch.tensor(obs, dtype=torch.float32).to(device)
@@ -121,12 +178,12 @@ def train(policy_reuse: bool = False,
             if policy_reuse and len(policy_bank) > 0:
                 # Runtime safety check: the current live policy should never also
                 # appear inside the old-policy bank used for this rollout.
-                assert all(old_policy is not policy for old_policy in policy_bank)
+                assert all(old_policy is not policy for _, old_policy in policy_bank)
                 candidate_probs = []
 
                 # Frozen old policies: inference-only to avoid autograd overhead.
                 with torch.no_grad():
-                    for old_policy in policy_bank:
+                    for _, old_policy in policy_bank:
                         old_probs = monte_carlo_action_probs(old_policy, state, num_samples)
                         candidate_probs.append(old_probs)
 
@@ -179,15 +236,31 @@ def train(policy_reuse: bool = False,
         # always stores strictly older checkpoints than the live policy.
         if policy_reuse:
             pre_len = len(policy_bank)
-            update_policy_bank(policy_bank, policy, device, max_policy_bank_size)
+            start = max(0, len(reward_sums) - score_window)
+            score = float(sum(reward_sums[start:]) / max(1, len(reward_sums) - start))
 
-            # If FIFO eviction happened, shift historical logits left so each
-            # active slot continues to align with the corresponding bank policy.
-            if pre_len == max_policy_bank_size:
+            prev_indices = update_policy_bank(policy_bank,
+                                              policy,
+                                              device,
+                                              max_policy_bank_size,
+                                              score,
+                                              diversity_threshold=diversity_threshold)
+
+            with torch.no_grad():
+                new_logits = torch.zeros_like(reuse_logits.data)
+                for new_idx, old_idx in enumerate(prev_indices):
+                    if old_idx is not None:
+                        new_logits[new_idx] = reuse_logits.data[old_idx]
+
+                # Keep the current-policy bias when moving to a new active slot.
+                new_current_idx = len(policy_bank)
+                old_current_idx = pre_len
+                new_logits[new_current_idx] = reuse_logits.data[old_current_idx]
+                reuse_logits.data.copy_(new_logits)
+
+            if len(policy_bank) == 0:
                 with torch.no_grad():
-                    reuse_logits.data[:-2] = reuse_logits.data[1:-1].clone()
-                    # Reset the newly opened historical slot after the shift.
-                    reuse_logits.data[-2] = 0.0
+                    reuse_logits.data[0] = 0.0
 
         loss.backward()
         policy_optimizer.step()
