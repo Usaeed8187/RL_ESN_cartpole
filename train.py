@@ -388,7 +388,26 @@ def train(policy_reuse: bool = False,
             if policy_reuse and len(subpolicy_prob_history) > 0:
                 active_count = len(policy_bank) + 1 + int(use_domain_knowledge)
                 active_probs = subpolicy_prob_history[-1][:active_count].tolist()
-                print(f'Episode {episode}, Total Reward: {reward_sum}, Reuse probs: {active_probs}')
+
+                num_old = len(policy_bank)
+
+                new_prob = active_probs[num_old]
+                dk_prob = active_probs[num_old + 1] if use_domain_knowledge else None
+
+                old_probs = active_probs[:num_old]
+
+                # format reuse probabilities
+                reuse_parts = [f"new:{new_prob:.3f}"]
+                for i, p in enumerate(old_probs):
+                    reuse_parts.append(f"old{i+1}:{p:.3f}")
+
+                reuse_string = ", ".join(reuse_parts)
+
+                print(f"Episode {episode}, Total Reward: {reward_sum}")
+                if use_domain_knowledge:
+                    print(f"DK prob: {dk_prob:.3f}")
+                print(f"RL reuse probs: [{reuse_string}]")
+                
             else:
                 print(f'Episode {episode}, Total Reward: {reward_sum}')
 
