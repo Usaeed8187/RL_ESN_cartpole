@@ -112,18 +112,6 @@ def train(policy_reuse: bool = False,
         for old_policy in policy_bank:
             old_policy.esn.reset_state()
 
-        # Update policy bank with the policy from previous training stage
-        if policy_reuse and episode > 1:
-            pre_len = len(policy_bank)
-            update_policy_bank(policy_bank, policy, device, max_policy_bank_size)
-
-            # If FIFO eviction happened, shift corresponding logits left so each
-            # bank slot keeps matching the same policy index in the bounded bank.
-            if pre_len == max_policy_bank_size:
-                with torch.no_grad():
-                    reuse_logits.data[:-2] = reuse_logits.data[1:-1].clone()
-                    reuse_logits.data[-2] = 0.0
-
         state = torch.tensor(obs, dtype=torch.float32).to(device)
         rewards = []
         log_probs = []
@@ -131,6 +119,9 @@ def train(policy_reuse: bool = False,
 
         while not done:
             if policy_reuse and len(policy_bank) > 0:
+                # Runtime safety check: the current live policy should never also
+                # appear inside the old-policy bank used for this rollout.
+                assert all(old_policy is not policy for old_policy in policy_bank)
                 candidate_probs = []
 
                 # Frozen old policies: inference-only to avoid autograd overhead.
@@ -184,6 +175,20 @@ def train(policy_reuse: bool = False,
         if reuse_optimizer is not None:
             reuse_optimizer.zero_grad()
 
+        # Snapshot the rollout policy immediately before updating it, so policy_bank
+        # always stores strictly older checkpoints than the live policy.
+        if policy_reuse:
+            pre_len = len(policy_bank)
+            update_policy_bank(policy_bank, policy, device, max_policy_bank_size)
+
+            # If FIFO eviction happened, shift historical logits left so each
+            # active slot continues to align with the corresponding bank policy.
+            if pre_len == max_policy_bank_size:
+                with torch.no_grad():
+                    reuse_logits.data[:-2] = reuse_logits.data[1:-1].clone()
+                    # Reset the newly opened historical slot after the shift.
+                    reuse_logits.data[-2] = 0.0
+
         loss.backward()
         policy_optimizer.step()
         if reuse_optimizer is not None:
@@ -221,9 +226,9 @@ if __name__ == '__main__':
 
     plt.figure(figsize=(10, 6))
     # plt.plot(reward_sums_no_reuse, alpha=0.25, label='No Reuse (raw)', color='tab:blue')
-    plt.plot(smoothed_no_reuse, label=f'No Reuse (MA-{window})', color='tab:blue')
+    plt.plot(smoothed_no_reuse, label=f'No Reuse (No domain knowledge)', color='tab:blue')
     # plt.plot(reward_sums_reuse, alpha=0.25, label='Reuse (raw)', color='tab:orange')
-    plt.plot(smoothed_reuse, label=f'Reuse (MA-{window})', color='tab:orange')
+    plt.plot(smoothed_reuse, label=f'Reuse', color='tab:orange')
     plt.xlabel('Episode')
     plt.ylabel('Total Reward')
     plt.title('CartPole Reward Curves: Policy Reuse vs No Reuse')
