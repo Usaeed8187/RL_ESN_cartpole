@@ -212,12 +212,12 @@ if __name__ == '__main__':
     smoothed_no_reuse = moving_average(reward_sums_no_reuse, window=window)
     smoothed_reuse = moving_average(reward_sums_reuse, window=window)
 
-    np.savez('reward_sums.npz',
+    np.savez('results/reward_sums.npz',
              no_reuse=reward_sums_no_reuse,
              reuse=reward_sums_reuse,
              smoothed_no_reuse=smoothed_no_reuse,
              smoothed_reuse=smoothed_reuse)
-    print(f'Saved raw and smoothed reward sums to reward_sums.npz')
+    print(f'Saved raw and smoothed reward sums to results/reward_sums.npz')
 
     plt.figure(figsize=(10, 6))
     # plt.plot(reward_sums_no_reuse, alpha=0.25, label='No Reuse (raw)', color='tab:blue')
@@ -230,6 +230,6 @@ if __name__ == '__main__':
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig('reward_comparison.png')
+    plt.savefig('results/reward_comparison.png')
     plt.close()
     print(f'Saved reward plot to reward_comparison.png')
