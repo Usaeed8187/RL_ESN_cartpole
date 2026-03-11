@@ -123,7 +123,7 @@ def evaluate_domain_knowledge_policy(env_name: str = 'CartPole-v1',
         reward_sums.append(reward_sum)
 
         if episode % 10 == 0:
-            print(f'[DK only] Episode {episode}, Total Reward: {reward_sum}')
+            print(f'[DK only] Episode {episode}, Total Reward: {reward_sum}, Reuse probs: [1.0]')
 
     env.close()
     return reward_sums
@@ -385,7 +385,12 @@ def train(policy_reuse: bool = False,
         reward_sums.append(reward_sum)
 
         if episode % 10 == 0:
-            print(f'Episode {episode}, Total Reward: {reward_sum}')
+            if policy_reuse and len(subpolicy_prob_history) > 0:
+                active_count = len(policy_bank) + 1 + int(use_domain_knowledge)
+                active_probs = subpolicy_prob_history[-1][:active_count].tolist()
+                print(f'Episode {episode}, Total Reward: {reward_sum}, Reuse probs: {active_probs}')
+            else:
+                print(f'Episode {episode}, Total Reward: {reward_sum}')
 
     env.close()
     if policy_reuse:
