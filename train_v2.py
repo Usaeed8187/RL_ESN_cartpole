@@ -22,13 +22,15 @@ from utils import set_seed, reset_env
 
 
 def moving_average(values, window: int = 20):
-    """Compute moving average for visualization."""
+    """Compute moving average using only full windows."""
     if window <= 1:
         return values
+
     out = []
-    for idx in range(len(values)):
-        start = max(0, idx - window + 1)
-        out.append(sum(values[start:idx + 1]) / (idx - start + 1))
+    for idx in range(window - 1, len(values)):
+        start = idx - window + 1
+        out.append(sum(values[start:idx + 1]) / window)
+
     return out
 
 
