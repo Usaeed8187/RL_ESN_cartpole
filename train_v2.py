@@ -249,20 +249,28 @@ def train(policy_reuse: bool = False,
 
 
 if __name__ == '__main__':
-    reward_sums_no_reuse, _ = train(
-        policy_reuse=False,
-        use_domain_knowledge=False,
-    )
 
-    reward_sums_dk_only = evaluate_domain_knowledge_policy()
+    data = np.load('results/reward_sums_v2.npz', allow_pickle=True)
 
-    reward_sums_reuse_dk, subpolicy_prob_history = train(
-        policy_reuse=True,
-        use_domain_knowledge=True,
-        dk_initial_prob=0.9,
-    )
+    # reward_sums_no_reuse, _ = train(
+    #     policy_reuse=False,
+    #     use_domain_knowledge=False,
+    # )
+    reward_sums_no_reuse = data['no_reuse']
 
-    window = 20
+    # reward_sums_dk_only = evaluate_domain_knowledge_policy()
+    reward_sums_dk_only = data['dk_only']
+
+    dk_initial_prob = 0.5
+    # reward_sums_reuse_dk, subpolicy_prob_history = train(
+    #     policy_reuse=True,
+    #     use_domain_knowledge=True,
+    #     dk_initial_prob=dk_initial_prob,
+    # )
+    reward_sums_reuse_dk = data['reuse_dk']
+    subpolicy_prob_history = data['subpolicy_prob_history']
+
+    window = 50
     smoothed_no_reuse = moving_average(reward_sums_no_reuse, window=window)
     smoothed_reuse_dk = moving_average(reward_sums_reuse_dk, window=window)
     smoothed_dk_only = moving_average(reward_sums_dk_only, window=window)
@@ -289,12 +297,12 @@ if __name__ == '__main__':
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig('results/reward_comparison_v2.png')
+    plt.savefig('results/reward_comparison_v2_starting_dk_prob_{}.png'.format(dk_initial_prob))
     plt.close()
-    print('Saved reward plot to results/reward_comparison_v2.png')
+    print('Saved reward plot to results/reward_comparison_v2_starting_dk_prob_{}.png'.format(dk_initial_prob))
 
     plot_subpolicy_probabilities(
         subpolicy_prob_history,
         labels=['New policy', 'Domain-knowledge policy'],
-        output_path='results/subpolicy_probabilities_v2.png'
+        output_path='results/subpolicy_probabilities_v2_starting_dk_prob_{}.png'.format(dk_initial_prob)
     )
